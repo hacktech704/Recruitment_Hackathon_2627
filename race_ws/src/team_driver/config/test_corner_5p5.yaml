@@ -1,0 +1,7 @@
+/**:
+  ros__parameters:
+    raceline_csv: /hackathon/race_ws/src/team_driver/config/icra26_clearance.csv
+    max_speed: 5.8
+    lateral_accel: 5.5
+    brake_accel: 3.5
+    max_range: 8.0

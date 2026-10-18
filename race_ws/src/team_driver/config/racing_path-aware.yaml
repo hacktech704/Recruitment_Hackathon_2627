@@ -1,0 +1,6 @@
+driver:
+  ros__parameters:
+    raceline_csv: /hackathon/maps/icra26_centerline.csv
+    max_speed: 5.8
+    lateral_accel: 5.0
+    brake_accel: 3.5

@@ -1,0 +1,6 @@
+driver:
+  ros__parameters:
+    raceline_csv: /hackathon/race_ws/src/team_driver/config/icra26_time.csv
+    max_speed: 5.8
+    lateral_accel: 5.0
+    brake_accel: 3.5

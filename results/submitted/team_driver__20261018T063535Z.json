@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "referee_version": "1.0.0",
+  "team": "team_driver",
+  "run_id": "20261018T063535Z",
+  "track": "icra26",
+  "map_path": "/hackathon/maps/icra26",
+  "finished_at_utc": "2026-10-18T06:36:41+00:00",
+  "environment": {
+    "real_time_factor": -6.161,
+    "wall_duration_s": 59.07,
+    "sim_duration_s": -363.94,
+    "callback_errors": 0
+  },
+  "status": "DISQUALIFIED",
+  "reason": "11 collisions exceeds the limit of 10",
+  "scored": false,
+  "rules": {
+    "warmup_laps": 1,
+    "timed_laps": 10,
+    "collision_penalty_s": 10.0,
+    "max_collisions": 10,
+    "collision_interval_s": 1.0,
+    "min_lap_time_s": 2.0,
+    "session_timeout_s": 900.0,
+    "stuck_speed_mps": 0.05,
+    "stuck_timeout_s": 15.0
+  },
+  "laps_completed": 0,
+  "laps_required": 10,
+  "collisions": 11,
+  "collision_limit": 10,
+  "best_lap_time": null,
+  "best_lap_time_raw": null,
+  "best_lap_number": null,
+  "total_time": null,
+  "total_time_raw": null,
+  "total_penalty_s": 0,
+  "laps": []
+}

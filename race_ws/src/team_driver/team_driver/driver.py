@@ -1,43 +1,16 @@
 #!/usr/bin/env python3
-"""YOUR DRIVER GOES HERE.
+"""Candidate Track 1 DeepSpeed driver: pure pursuit with preview braking + LiDAR guard.
 
-This is the node the judges run. Keep `driver` as the executable name and
-`/drive` as the output topic and everything else is yours to change - rewrite
-this file completely if you want to.
+Copy BOTH driver.py and hybrid_core.py to race_ws/src/team_driver/team_driver/
+Back up your original driver.py first. The official centreline stays untouched.
 
---------------------------------------------------------------------------
-THIS TEMPLATE DOES NOT DRIVE
---------------------------------------------------------------------------
-It is wiring, not a driver. It connects to the simulator, subscribes to the
-sensors, and then asks for a slow constant speed with the wheels straight. It
-will set off from the grid and into the first thing in front of it. That is
-deliberate and it is the whole point: **there is no algorithm here and no
-algorithm is shipped anywhere else in this repository.** Writing one is the
-hackathon.
-
-What the template is good for is proving your setup works. If the car moves
-when you run it, then the image, the bridge, the workspace, the topics and
-your commands are all correct, and every problem left is yours.
-
-    ros2 run team_driver driver
-    ros2 launch team_driver driver.launch.py
-
-`docs/04-algorithms.md` lists the approaches worth starting from - reactive
-ones that need nothing but the LiDAR, planners that follow a line, model-based
-control, and learned policies - with what each needs and where each breaks.
-Pick one and replace `plan()` below.
-
-What you are allowed to read (see docs/06-rules.md):
-    /scan               LiDAR, 819 beams over 270 degrees
-    /ego_racecar/odom   ground-truth pose and velocity - ALLOWED and RECOMMENDED
-    TF, /map            the static map
-What you publish:
-    /drive              AckermannDriveStamped - you ask for a SPEED, and the
-                        simulator closes that loop for you
-    /driver/...         anything of your own, for visualisation
+Original implementation; standard algorithm inspirations:
+NTU DeepSpeed hackathon documentation, and open F1TENTH gap-follow examples.
 """
-
 import math
+import hashlib
+from pathlib import Path
+from ament_index_python.packages import get_package_share_directory
 
 import numpy as np
 import rclpy
@@ -45,133 +18,111 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
-from visualization_msgs.msg import Marker, MarkerArray
+
+from team_driver.hybrid_core import HybridController
 
 
 class Driver(Node):
-
     def __init__(self):
         super().__init__('driver')
-
-        # Declared parameters can be retuned without editing code:
-        #   ros2 run team_driver driver --ros-args -p crawl_speed:=2.0
-        # Add your own as you go; config/driver_params.yaml loads them.
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('crawl_speed', 1.0)        # [m/s]
-        self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
+        self.declare_parameter('raceline_csv', str(Path(get_package_share_directory('team_driver')) / 'config' / 'icra26_clearance.csv'))
+        self.declare_parameter('max_speed', 6.2)          # m/s: change one parameter at a time
+        self.declare_parameter('lateral_accel', 10.0)      # m/s^2
+        self.declare_parameter('brake_accel', 3.5)        # m/s^2
+        self.declare_parameter('max_range', 8.0)         # metres: LiDAR clipping distance
 
-        self.crawl_speed = self.get_parameter('crawl_speed').value
-        self.max_range = self.get_parameter('max_range').value
+        self.declare_parameter('accel_limit', 4.5)
+        self.declare_parameter('lookahead_scale', 0.90)
+        self.declare_parameter('project_progress', False)
+        self.declare_parameter('use_speed_profile', False)
+        self.declare_parameter('response_delay', 0.0)
+        self.declare_parameter('prediction_horizon', 0.0)
 
-        # Latest known pose and speed. Ground truth from the simulator, which
-        # the rules allow you to use - so use it.
-        self.position = None      # (x, y) in the map frame
-        self.yaw = 0.0            # [rad]
-        self.speed = 0.0          # [m/s]
-
+        path = Path(str(self.get_parameter('raceline_csv').value))
+        if not path.is_file():
+            raise FileNotFoundError(f"Centreline missing: {path}. Check repository mount.")
+        waypoints = np.loadtxt(str(path), delimiter=',', comments='#')
+        self.controller = HybridController(
+            waypoints,
+            max_speed=float(self.get_parameter('max_speed').value),
+            lateral_accel=float(self.get_parameter('lateral_accel').value),
+            brake_accel=float(self.get_parameter('brake_accel').value),
+            accel_limit=float(self.get_parameter('accel_limit').value),
+            lookahead_scale=float(self.get_parameter('lookahead_scale').value),
+            project_progress=bool(self.get_parameter('project_progress').value),
+            use_speed_profile=bool(self.get_parameter('use_speed_profile').value),
+            response_delay=float(self.get_parameter('response_delay').value),
+            prediction_horizon=float(self.get_parameter('prediction_horizon').value),
+        )
+        self.max_range = float(self.get_parameter('max_range').value)
+        self.position = None
+        self.yaw = 0.0
+        self.speed = 0.0
+        self.yaw_rate = 0.0
+        self.beta = 0.0
+        self.odom_stamp = None
+        self.last_stamp = None
+        self.scan_count = 0
         self.drive_pub = self.create_publisher(
-            AckermannDriveStamped, self.get_parameter('drive_topic').value, 10)
-        self.marker_pub = self.create_publisher(MarkerArray, '/driver/markers', 1)
-
+            AckermannDriveStamped, str(self.get_parameter('drive_topic').value), 10)
         self.create_subscription(
-            LaserScan, self.get_parameter('scan_topic').value, self.scan_callback, 10)
+            LaserScan, str(self.get_parameter('scan_topic').value), self.scan_callback, 10)
         self.create_subscription(
-            Odometry, self.get_parameter('odom_topic').value, self.odom_callback, 10)
+            Odometry, str(self.get_parameter('odom_topic').value), self.odom_callback, 10)
+        self.get_logger().info(f"Hybrid loaded {len(waypoints)} points from {path}")
+        settings = {name: self.get_parameter(name).value for name in
+                    ('max_speed', 'lateral_accel', 'brake_accel', 'accel_limit',
+                     'lookahead_scale', 'project_progress', 'max_range',
+                     'use_speed_profile', 'response_delay', 'prediction_horizon')}
+        self.get_logger().info(f"CONTROLLER_CONFIG {settings} "
+                               f"line_sha256={hashlib.sha256(path.read_bytes()).hexdigest()}")
 
-        self._marker_divisor = 0
-        self.get_logger().warn(
-            'team_driver is up, but this template has no driving logic: it will '
-            'crawl straight ahead until it hits something. Implement plan().')
-
-    # ------------------------------------------------------------------
-    # Odometry: where the car is. Free, accurate, and worth building on.
-    # ------------------------------------------------------------------
     def odom_callback(self, msg):
-        self.position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
+        self.odom_stamp = float(msg.header.stamp.sec) + 1e-9 * float(msg.header.stamp.nanosec)
+        self.position = (float(msg.pose.pose.position.x), float(msg.pose.pose.position.y))
         q = msg.pose.pose.orientation
-        self.yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
-                              1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self.yaw = math.atan2(2.0*(q.w*q.z + q.x*q.y),
+                              1.0 - 2.0*(q.y*q.y + q.z*q.z))
         self.speed = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
+        self.yaw_rate = float(msg.twist.twist.angular.z)
+        self.beta = math.atan2(float(msg.twist.twist.linear.y), float(msg.twist.twist.linear.x))
 
-    # ------------------------------------------------------------------
-    # The control loop, once per LiDAR scan (about 40 Hz).
-    # ------------------------------------------------------------------
-    def scan_callback(self, scan):
-        ranges, angles = self.preprocess(scan)
-        steering, speed = self.plan(ranges, angles)
-        self.publish(steering, speed)
-
-        self._marker_divisor = (self._marker_divisor + 1) % 10
-        if self._marker_divisor == 0:
-            self.publish_marker(steering)
-
-    def preprocess(self, scan):
-        """Turn a raw scan into clean ranges plus the angle of each beam.
-
-        Kept because every approach needs some version of it and the details
-        are fiddly rather than interesting: the LiDAR reports NaN and inf, and
-        arithmetic on those propagates silently through everything downstream.
-        """
-        ranges = np.asarray(scan.ranges, dtype=np.float64)
+    def scan_callback(self, msg):
+        if self.position is None:
+            return
+        ranges = np.asarray(msg.ranges, dtype=np.float64)
         ranges = np.nan_to_num(ranges, nan=0.0, posinf=self.max_range, neginf=0.0)
         ranges = np.clip(ranges, 0.0, self.max_range)
-
-        angles = scan.angle_min + np.arange(len(ranges)) * scan.angle_increment
-        return ranges, angles
-
-    # ==================================================================
-    # THIS IS THE PART YOU WRITE.
-    # ==================================================================
-    def plan(self, ranges, angles):
-        """Decide what the car should do, given the latest scan.
-
-        Returns `(steering, speed)`: a steering angle in radians, and a speed
-        in m/s. Unlike Track 2, the speed is a genuine request - the simulator
-        runs the controller that achieves it - so you can think in the units
-        your algorithm naturally produces.
-
-        Right now it returns "straight ahead, slowly", which is not driving:
-        it ignores `ranges` entirely, so the car will hold its heading off the
-        grid and put itself into the first wall it meets. Replace the whole
-        method.
-
-        You have more to work with than the scan. `self.position`, `self.yaw`
-        and `self.speed` are ground truth from /ego_racecar/odom and are yours
-        to use, the occupancy grid is published on /map, and nothing stops you
-        subscribing to more topics, loading a line you computed offline, or
-        running a policy you trained. See docs/04-algorithms.md for the
-        approaches and what each one needs.
-        """
-        return 0.0, self.crawl_speed
-
-    # ------------------------------------------------------------------
-    # Output
-    # ------------------------------------------------------------------
-    def publish(self, steering, speed):
-        msg = AckermannDriveStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.drive.steering_angle = float(steering)
-        msg.drive.speed = float(speed)
-        self.drive_pub.publish(msg)
-
-    def publish_marker(self, target_angle):
-        """Draw where the car thinks it is going. Add /driver/markers in RViz."""
-        marker = Marker()
-        marker.header.frame_id = 'ego_racecar/base_link'
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = 'team_driver'
-        marker.id = 0
-        marker.type = Marker.ARROW
-        marker.action = Marker.ADD
-        marker.scale.x, marker.scale.y, marker.scale.z = 1.5, 0.15, 0.15
-        marker.color.g, marker.color.b, marker.color.a = 0.8, 1.0, 0.9
-        marker.pose.orientation.z = math.sin(target_angle / 2.0)
-        marker.pose.orientation.w = math.cos(target_angle / 2.0)
-        array = MarkerArray()
-        array.markers.append(marker)
-        self.marker_pub.publish(array)
+        angles = msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
+        stamp = float(msg.header.stamp.sec) + 1e-9 * float(msg.header.stamp.nanosec)
+        dt = 0.025 if self.last_stamp is None else stamp - self.last_stamp
+        self.last_stamp = stamp
+        age = stamp - self.odom_stamp
+        self.controller.motion_state = ((self.yaw_rate, self.beta)
+            if 0 <= age <= .03 else None)
+        cmd = self.controller.step(
+            self.position[0], self.position[1], self.yaw, self.speed,
+            ranges, angles, dt=dt)
+        out = AckermannDriveStamped()
+        out.header.stamp = self.get_clock().now().to_msg()
+        out.drive.steering_angle = float(cmd.steering)
+        out.drive.speed = float(cmd.speed)
+        self.drive_pub.publish(out)
+        self.scan_count += 1
+        if self.scan_count % 8 == 0:
+            self.get_logger().info(
+                f"{cmd.mode} v_cmd={cmd.speed:.2f} steering={cmd.steering:+.2f} "
+                f"track_error={cmd.path_error:.2f} front={cmd.front_range:.2f} "
+                f"sim_t={stamp:.3f} x={self.position[0]:.3f} "
+                f"y={self.position[1]:.3f} yaw={self.yaw:.3f} "
+                f"v_actual={self.speed:.3f} "
+                f"v_plan={cmd.planned_speed:.3f} v_guard={cmd.guarded_speed:.3f} "
+                f"odom_age={stamp - self.odom_stamp:.4f} dt={dt:.4f} "
+                f"idx={cmd.nearest_index} yaw_rate={self.yaw_rate:.4f} "
+                f"beta={self.beta:.4f} pred_delta={self.controller.prediction_delta:.4f}")
 
 
 def main(args=None):
